@@ -1,4 +1,4 @@
-<script>
+<script lang="ts">
 	import {
 		MultiSelect,
 		TextInput,
@@ -8,17 +8,31 @@
 		Button,
 	} from "carbon-components-svelte";
 	import toast from "svelte-french-toast";
-	import { onMount } from "svelte";
+	import { onMount, onDestroy, tick } from "svelte";
 
 	import { checkLatex } from "$lib/latexStuff";
 	import Problem from "$lib/components/Problem.svelte";
 	import LatexKeyboard from "$lib/components/editor/LatexKeyboard.svelte";
 	import ImageManager from "$lib/components/images/ImageManager.svelte";
+	import CollaborationWidget from "$lib/components/CollaborationWidget.svelte";
+	import CursorIndicator from "$lib/components/CursorIndicator.svelte";
 	import { user } from "$lib/sessionStore";
 	import { handleError } from "$lib/handleError.ts";
 	import { getGlobalTopics } from "$lib/supabase";
 	import { supabase } from "$lib/supabaseClient";
 	import DiffMatchPatch from "diff-match-patch";
+	import {
+		subscribeToCollaboration,
+		fetchActiveEditors,
+		updateCollaborationData,
+		removeCollaborationData,
+		subscribeToFieldUpdates,
+		broadcastFieldUpdate,
+		removeBroadcastChannel,
+		removeOtherFieldEntries,
+	} from "$lib/utils/collaboration";
+	import type { CollaborationEditor, FieldUpdate } from "$lib/utils/collaboration";
+	import type { RealtimeChannel } from "@supabase/supabase-js";
 
 	export let originalProblem = null;
 	export let originalImages = [];
@@ -78,10 +92,208 @@
 		for (const field of fieldList) {
 			if (document.activeElement === fieldrefs[field]) {
 				activeTextarea = field;
+				updateCursorPosition(field);
 				return;
 			}
 		}
 		activeTextarea = null;
+	}
+
+	let activeEditors: CollaborationEditor[] = [];
+	let collaborationChannel: RealtimeChannel | null = null;
+	let fieldUpdateChannel: RealtimeChannel | null = null;
+	let cursorUpdateInterval: ReturnType<typeof setInterval> | null = null;
+	let editorRefreshInterval: ReturnType<typeof setInterval> | null = null;
+	let currentFieldForUser: string | null = null;
+	let isApplyingRemoteUpdate = false;
+	let lastBroadcastTime: { [key: string]: number } = {};
+	const BROADCAST_THROTTLE = 500; // ms
+
+	async function updateCursorPosition(fieldName: string) {
+		if (!originalProblem?.id || !$user?.id) return;
+		
+		const fieldElement = fieldrefs[fieldName];
+
+		if (currentFieldForUser && currentFieldForUser !== fieldName) {
+			await removeOtherFieldEntries(originalProblem.id, $user.id, fieldName);
+		}
+		currentFieldForUser = fieldName;
+
+		const cursorPos = fieldElement?.selectionStart ?? 0;
+		const selectionStart = fieldElement?.selectionStart ?? 0;
+		const selectionEnd = fieldElement?.selectionEnd ?? 0;
+
+		await updateCollaborationData(
+			originalProblem.id,
+			$user.id,
+			fieldName,
+			cursorPos,
+			selectionStart,
+			selectionEnd
+		);
+	}
+
+	async function handleFieldInput(fieldName: string) {
+		if (!originalProblem?.id || !$user?.id) return;
+		
+		updateFields();
+		onDirty();
+		
+		updateCursorPosition(fieldName);
+		
+		const now = Date.now();
+		const lastBroadcast = lastBroadcastTime[fieldName] || 0;
+		if (now - lastBroadcast > BROADCAST_THROTTLE) {
+			lastBroadcastTime[fieldName] = now;
+			console.log("Broadcasting field update:", fieldName, fields[fieldName].substring(0, 50));
+			await broadcastFieldUpdate(
+				originalProblem.id,
+				fieldName,
+				fields[fieldName],
+				$user.id
+			);
+		}
+	}
+
+	function handleRemoteFieldUpdate(update: FieldUpdate) {
+		console.log("handleRemoteFieldUpdate called:", update);
+		if (isApplyingRemoteUpdate || update.user_id === $user?.id) {
+			console.log("Skipping update - isApplyingRemoteUpdate:", isApplyingRemoteUpdate, "user_id match:", update.user_id === $user?.id);
+			return;
+		}
+		
+		const fieldName = update.field_name;
+		if (!fieldList.includes(fieldName)) {
+			console.log("Field name not in fieldList:", fieldName);
+			return;
+		}
+
+		const fieldElement = fieldrefs[fieldName];
+		const isFieldFocused = activeTextarea === fieldName;
+		const currentContent = fields[fieldName];
+		const remoteContent = update.content;
+
+		if (currentContent === remoteContent) {
+			return;
+		}
+
+		console.log("Applying remote update to field:", fieldName, "focused:", isFieldFocused);
+		isApplyingRemoteUpdate = true;
+
+		if (isFieldFocused && fieldElement) {
+			const cursorPos = fieldElement.selectionStart || 0;
+			const selectionEnd = fieldElement.selectionEnd || cursorPos;
+			
+			const diffs = dmp.diff_main(currentContent, remoteContent);
+			dmp.diff_cleanupSemantic(diffs);
+			
+			let newCursorPos = cursorPos;
+			let currentPos = 0;
+			
+			for (const [operation, text] of diffs) {
+				if (operation === 0) {
+					currentPos += text.length;
+					if (currentPos >= cursorPos) {
+						break;
+					}
+				} else if (operation === -1) {
+					if (currentPos + text.length <= cursorPos) {
+						newCursorPos -= text.length;
+						currentPos += text.length;
+					} else if (currentPos < cursorPos) {
+						newCursorPos = currentPos;
+						break;
+					} else {
+						break;
+					}
+				} else if (operation === 1) {
+					if (currentPos <= cursorPos) {
+						newCursorPos += text.length;
+					}
+				}
+			}
+			
+			fields[fieldName] = remoteContent;
+			
+			updateFields();
+			
+			setTimeout(() => {
+				if (fieldElement && document.activeElement === fieldElement) {
+					const finalCursorPos = Math.max(0, Math.min(newCursorPos, remoteContent.length));
+					fieldElement.setSelectionRange(finalCursorPos, finalCursorPos);
+				}
+			}, 0);
+		} else {
+			fields[fieldName] = remoteContent;
+			updateFields();
+		}
+
+		isApplyingRemoteUpdate = false;
+	}
+
+	async function initializeCollaboration() {
+		if (!originalProblem?.id || !$user?.id) return;
+
+		await tick();
+
+		const initialField = activeTextarea ?? "problem";
+		await updateCursorPosition(initialField);
+
+		activeEditors = await fetchActiveEditors(originalProblem.id);
+		console.log("Initial active editors:", activeEditors);
+
+		collaborationChannel = subscribeToCollaboration(originalProblem.id, {
+			onEditorUpdate: (editors) => {
+				console.log("Active editors updated:", editors);
+				activeEditors = [...(editors || [])];
+			},
+		});
+		
+		editorRefreshInterval = setInterval(async () => {
+			const editors = await fetchActiveEditors(originalProblem.id);
+			activeEditors = [...(editors || [])];
+		}, 2000);
+
+		fieldUpdateChannel = subscribeToFieldUpdates(
+			originalProblem.id,
+			handleRemoteFieldUpdate
+		);
+
+		cursorUpdateInterval = setInterval(() => {
+			if (activeTextarea) {
+				updateCursorPosition(activeTextarea);
+			}
+		}, 500);
+
+		window.addEventListener("beforeunload", () => {
+			removeCollaborationData(originalProblem.id, $user.id);
+		});
+	}
+
+	function cleanupCollaboration() {
+		if (cursorUpdateInterval) {
+			clearInterval(cursorUpdateInterval);
+			cursorUpdateInterval = null;
+		}
+		if (editorRefreshInterval) {
+			clearInterval(editorRefreshInterval);
+			editorRefreshInterval = null;
+		}
+		if (collaborationChannel) {
+			supabase.removeChannel(collaborationChannel);
+			collaborationChannel = null;
+		}
+		if (fieldUpdateChannel) {
+			if (originalProblem?.id) {
+				removeBroadcastChannel(originalProblem.id);
+			} else {
+				supabase.removeChannel(fieldUpdateChannel);
+			}
+			fieldUpdateChannel = null;
+		}
+		if (originalProblem?.id && $user?.id) {
+			removeCollaborationData(originalProblem.id, $user.id);
+		}
 	}
 
 	function addToField(fieldName, fieldValue) {
@@ -152,6 +364,11 @@
 	// Call `loadHistoryFromSupabase` when the component mounts
 	onMount(() => {
 		loadHistoryFromSupabase();
+		initializeCollaboration();
+	});
+
+	onDestroy(() => {
+		cleanupCollaboration();
 	});
 
 	async function getPacificTime() {
@@ -588,10 +805,14 @@
 						labelText="Problem"
 						bind:value={fields.problem}
 						bind:ref={fieldrefs.problem}
-						on:input={updateFields}
+						on:input={() => handleFieldInput("problem")}
+						on:keyup={() => updateCursorPosition("problem")}
+						on:click={() => updateCursorPosition("problem")}
 						required={true}
-						on:input={onDirty}
 					/>
+					{#each activeEditors.filter(e => e.field_name === "problem" && e.user_id !== $user?.id) as editor}
+						<CursorIndicator {editor} fieldElement={fieldrefs.problem} />
+					{/each}
 					<div style="position: absolute; top: 5px; right: 5px;">
 						{#if show}
 							<span
@@ -623,12 +844,14 @@
 						labelText="Answer"
 						bind:value={fields.answer}
 						bind:ref={fieldrefs.answer}
-						on:input={() => {
-							updateFields();
-							onDirty();
-						}}
+						on:input={() => handleFieldInput("answer")}
+						on:keyup={() => updateCursorPosition("answer")}
+						on:click={() => updateCursorPosition("answer")}
 						required={true}
 					/>
+					{#each activeEditors.filter(e => e.field_name === "answer" && e.user_id !== $user?.id) as editor}
+						<CursorIndicator {editor} fieldElement={fieldrefs.answer} />
+					{/each}
 					<div style="position: absolute; top: 5px; right: 5px;">
 						{#if show}
 							<span
@@ -660,12 +883,14 @@
 						labelText="Solution"
 						bind:value={fields.solution}
 						bind:ref={fieldrefs.solution}
-						on:input={() => {
-							updateFields();
-							onDirty();
-						}}
+						on:input={() => handleFieldInput("solution")}
+						on:keyup={() => updateCursorPosition("solution")}
+						on:click={() => updateCursorPosition("solution")}
 						required={true}
 					/>
+					{#each activeEditors.filter(e => e.field_name === "solution" && e.user_id !== $user?.id) as editor}
+						<CursorIndicator {editor} fieldElement={fieldrefs.solution} />
+					{/each}
 					<div style="position: absolute; top: 5px; right: 5px;">
 						{#if show}
 							<span
@@ -697,12 +922,14 @@
 						labelText="Comments"
 						bind:value={fields.comment}
 						bind:ref={fieldrefs.comment}
-						on:input={() => {
-							updateFields();
-							onDirty();
-						}}
+						on:input={() => handleFieldInput("comment")}
+						on:keyup={() => updateCursorPosition("comment")}
+						on:click={() => updateCursorPosition("comment")}
 						required={true}
 					/>
+					{#each activeEditors.filter(e => e.field_name === "comment" && e.user_id !== $user?.id) as editor}
+						<CursorIndicator {editor} fieldElement={fieldrefs.comment} />
+					{/each}
 					<div style="position: absolute; top: 5px; right: 5px;">
 						{#if show}
 							<span
@@ -781,6 +1008,9 @@
 		<div class="col">
 			<br />
 			<br />
+			{#if originalProblem?.id}
+				<CollaborationWidget {activeEditors} />
+			{/if}
 			{#if onSubmit}
 				<div
 					style="display: flex; flex-direction: column; align-items: center;"
